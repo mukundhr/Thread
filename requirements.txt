@@ -1,0 +1,4 @@
+ddgs
+requests
+flask
+python-dotenv
