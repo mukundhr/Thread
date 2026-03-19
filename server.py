@@ -1,9 +1,3 @@
-"""
-server.py — THREAD API + static file server
-Run: python server.py
-Then open: http://localhost:5050
-"""
-
 import os
 import json
 import threading

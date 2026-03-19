@@ -1,8 +1,3 @@
-"""
-searcher.py — web search for THREAD
-Pulls real articles per topic + per interrogation round using DuckDuckGo.
-"""
-
 import re
 import time
 import requests

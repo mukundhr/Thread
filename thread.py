@@ -1,13 +1,3 @@
-"""
-THREAD - Observable Reasoning Agent with Calibrated Live Epistemic tracking
-
-Usage:
-  python thread.py "why wars happen"
-  python thread.py "why wars happen" --no-search
-  python thread.py "topic 1" "topic 2" "topic 3"          # compare
-  python thread.py "why wars happen" --longitudinal        # view past runs
-"""
-
 import os
 import re
 import json
