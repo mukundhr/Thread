@@ -307,6 +307,13 @@ const api = p => fetch(p).then(r=>r.json());
 // ── helpers ──
 const pct = v => Math.round(v*100);
 const confColor = v => v>=0.65?'var(--green)':v>=0.4?'var(--amber)':'var(--red)';
+const confLabel = v => {
+  if(v>=0.80) return "Strongly supported";
+  if(v>=0.65) return "Well supported";
+  if(v>=0.50) return "Moderately supported";
+  if(v>=0.35) return "Contested";
+  return "Poorly supported";
+};
 const confBg    = v => v>=0.65?'var(--green-bg)':v>=0.4?'var(--amber-bg)':'var(--red-bg)';
 
 const ROUND_COLORS = {
@@ -465,9 +472,9 @@ function FinalView({runId}){
         <div>
           <div className="hero-conf-label">How confident</div>
           <ConfBar value={c} width={140} llmValue={fv.llm_confidence}/>
-          <div className="conf-num" style={{color:confColor(c)}}>{pct(c)}%</div>
+          <div className="conf-num" style={{color:confColor(c)}}>{confLabel(c)}</div>
           <div style={{fontSize:'.7rem',color:'var(--ink3)',marginTop:4,fontFamily:'var(--mono)'}}>
-            Computed from sources + evidence balance
+            {pct(c)}% computed from sources + evidence balance
           </div>
         </div>
         {fv.still_uncertain?.length>0&&(
@@ -552,59 +559,133 @@ function Snap({h,interrogation,articleMap,defaultOpen}){
 }
 
 // ── TRAJECTORY VIEW ──
-function TrajectoryView({runId}){
-  const [history,setHistory]=useState(null);
-  const [qs,setQs]=useState([]);
-  const [articles,setArticles]=useState([]);
+const FRAMEWORK_LABELS = ['Structural','Agent','Material'];
 
+function TrajectoryView({runId}){
+  const [arcs,setArcs]       = useState(null);
+  const [selArc,setSelArc]   = useState(null);
+  const [arcData,setArcData] = useState(null);
+
+  // load arcs list
   useEffect(()=>{
     if(!runId)return;
-    api(`/api/history?run_id=${runId}`).then(setHistory);
-    api(`/api/interrogations?run_id=${runId}`).then(setQs);
-    api(`/api/articles?run_id=${runId}`).then(setArticles);
+    setArcs(null); setArcData(null); setSelArc(null);
+    api(`/api/arcs?run_id=${runId}`).then(a=>{
+      setArcs(a);
+      if(a&&a.length) setSelArc(a[0].arc_id);
+    });
   },[runId]);
 
-  if(!runId) return <div className="empty">Select a topic and run from the sidebar</div>;
-  if(!history) return <div className="loading pulse">Loading…</div>;
+  // load selected arc detail
+  useEffect(()=>{
+    if(!selArc)return;
+    setArcData(null);
+    api(`/api/arc_history?arc_id=${selArc}`).then(setArcData);
+  },[selArc]);
+
+  if(!runId)  return <div className="empty">Select a topic and run from the sidebar</div>;
+  if(!arcs)   return <div className="loading pulse">Loading…</div>;
+
+  // fallback: old-style run with no arcs — load directly
+  if(arcs.length===0){
+    return <LegacyTrajectoryView runId={runId}/>;
+  }
+
+  const curArc = arcs.find(a=>a.arc_id===selArc);
+  const history = arcData?.history || [];
+  const qs      = arcData?.interrogations || [];
 
   const qMap={};qs.forEach(q=>{qMap[q.iteration]=q});
-  const aMap={};articles.forEach(a=>{aMap[a.id]=a});
-
-  const h0=history[0],hL=history[history.length-1];
-  const delta=hL?hL.confidence-h0.confidence:0;
-
-  // inject delta into qMap for display
+  const aMap={};
   history.forEach((h,i)=>{
     if(i>0&&qMap[h.iteration]){
-      qMap[h.iteration].delta = h.confidence-history[i-1].confidence;
+      qMap[h.iteration].delta=h.confidence-history[i-1].confidence;
     }
   });
 
+  const h0=history[0], hL=history[history.length-1];
+  const delta=h0&&hL?hL.confidence-h0.confidence:0;
+  const color=FRAMEWORK_COLORS[curArc?.framework]||'var(--blue)';
+
+  return(
+    <div className="fade-in">
+      {/* Arc selector */}
+      <div style={{display:'flex',gap:8,marginBottom:20,flexWrap:'wrap'}}>
+        {arcs.map(a=>{
+          const c=FRAMEWORK_COLORS[a.framework]||'var(--ink3)';
+          const active=a.arc_id===selArc;
+          return(
+            <button key={a.arc_id} onClick={()=>setSelArc(a.arc_id)}
+              style={{padding:'7px 16px',borderRadius:20,border:`1.5px solid ${active?c:c+'44'}`,
+                background:active?c+'18':'transparent',color:active?c:'var(--ink2)',
+                fontFamily:'var(--sans)',fontWeight:active?600:400,fontSize:'.82rem',cursor:'pointer'}}>
+              {a.framework} lens
+              {a.confidence_label&&<span style={{marginLeft:6,fontSize:'.72rem',opacity:.8}}>
+                · {a.confidence_label}
+              </span>}
+            </button>
+          );
+        })}
+      </div>
+
+      {!arcData&&<div className="loading pulse">Loading arc…</div>}
+      {arcData&&history.length===0&&<div className="empty">No belief data for this arc.</div>}
+      {arcData&&history.length>0&&(
+        <>
+          {/* Final view for this arc */}
+          <FinalView runId={selArc}/>
+          <div className="metrics">
+            <div className="metric">
+              <div className="metric-val">{h0?confLabel(h0.confidence):'—'}</div>
+              <div className="metric-lbl">Started</div>
+            </div>
+            <div className="metric">
+              <div className={`metric-val ${delta>=0?'pos':'neg'}`}>
+                {hL?confLabel(hL.confidence):'—'}
+              </div>
+              <div className="metric-lbl">Ended · {delta>=0?'+':''}{pct(delta)}%</div>
+            </div>
+            <div className="metric">
+              <div className="metric-val neu">{qs.length-1}</div>
+              <div className="metric-lbl">Rounds</div>
+            </div>
+            <div className="metric">
+              <div className="metric-val" style={{color}}>{curArc?.framework}</div>
+              <div className="metric-lbl">Lens</div>
+            </div>
+          </div>
+          <Chart history={history}/>
+          <div className="section-label">How the belief evolved — click any round to expand</div>
+          {history.map((h,i)=>(
+            <Snap key={i} h={h} interrogation={qMap[h.iteration]} articleMap={{}} defaultOpen={i===0}/>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Fallback for runs created before the arc system
+function LegacyTrajectoryView({runId}){
+  const [history,setHistory]=useState(null);
+  const [qs,setQs]=useState([]);
+  useEffect(()=>{
+    if(!runId)return;
+    api(`/api/history?run_id=${runId}`).then(h=>setHistory(h||[]));
+    api(`/api/interrogations?run_id=${runId}`).then(setQs);
+  },[runId]);
+  if(!history) return <div className="loading pulse">Loading…</div>;
+  if(!history.length) return <div className="empty">No data for this run.</div>;
+  const qMap={};qs.forEach(q=>{qMap[q.iteration]=q});
+  history.forEach((h,i)=>{
+    if(i>0&&qMap[h.iteration]) qMap[h.iteration].delta=h.confidence-history[i-1].confidence;
+  });
   return(
     <div className="fade-in">
       <FinalView runId={runId}/>
-      <div className="metrics">
-        <div className="metric">
-          <div className="metric-val">{pct(h0.confidence)}%</div>
-          <div className="metric-lbl">Started at</div>
-        </div>
-        <div className="metric">
-          <div className={`metric-val ${delta>=0?'pos':'neg'}`}>{pct(hL.confidence)}%</div>
-          <div className="metric-lbl">Ended at · {delta>=0?'+':''}{pct(delta)}%</div>
-        </div>
-        <div className="metric">
-          <div className="metric-val neu">{articles.length}</div>
-          <div className="metric-lbl">Sources read</div>
-        </div>
-        <div className="metric">
-          <div className="metric-val">{qs.length-1}</div>
-          <div className="metric-lbl">Rounds of questioning</div>
-        </div>
-      </div>
-      <Chart history={history}/>
-      <div className="section-label">How the belief evolved — click any round to expand</div>
+      <div className="section-label">How the belief evolved</div>
       {history.map((h,i)=>(
-        <Snap key={i} h={h} interrogation={qMap[h.iteration]} articleMap={aMap} defaultOpen={i===0}/>
+        <Snap key={i} h={h} interrogation={qMap[h.iteration]} articleMap={{}} defaultOpen={i===0}/>
       ))}
     </div>
   );
@@ -612,13 +693,29 @@ function TrajectoryView({runId}){
 
 // ── Q&A VIEW ──
 function QAView({runId}){
-  const [qs,setQs]=useState(null);
-  const [history,setHistory]=useState([]);
+  const [arcs,setArcs]     = useState(null);
+  const [selArc,setSelArc] = useState(null);
+  const [qs,setQs]         = useState(null);
+  const [history,setHistory] = useState([]);
+
   useEffect(()=>{
     if(!runId)return;
-    api(`/api/interrogations?run_id=${runId}`).then(setQs);
-    api(`/api/history?run_id=${runId}`).then(setHistory);
+    setArcs(null);setQs(null);setSelArc(null);
+    api(`/api/arcs?run_id=${runId}`).then(a=>{
+      if(a&&a.length){ setArcs(a); setSelArc(a[0].arc_id); }
+      else{ setArcs([]); setSelArc(runId); } // legacy fallback
+    });
   },[runId]);
+
+  useEffect(()=>{
+    if(!selArc)return;
+    // try arc_history first, fall back to interrogations endpoint
+    api(`/api/arc_history?arc_id=${selArc}`).then(d=>{
+      if(d&&d.interrogations){ setQs(d.interrogations); setHistory(d.history||[]); }
+      else api(`/api/interrogations?run_id=${selArc}`).then(setQs);
+    });
+  },[selArc]);
+
   if(!runId) return <div className="empty">Select a run</div>;
   if(!qs) return <div className="loading pulse">Loading…</div>;
   const hMap={};history.forEach(h=>{hMap[h.iteration]=h});
@@ -626,6 +723,20 @@ function QAView({runId}){
     <div className="fade-in">
       <div className="page-title">How it questioned itself</div>
       <div className="page-sub">Every challenge asked and how the belief responded</div>
+      {arcs&&arcs.length>0&&(
+        <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap'}}>
+          {arcs.map(a=>{
+            const c=FRAMEWORK_COLORS[a.framework]||'var(--ink3)';
+            const active=a.arc_id===selArc;
+            return <button key={a.arc_id} onClick={()=>setSelArc(a.arc_id)}
+              style={{padding:'5px 14px',borderRadius:20,border:`1.5px solid ${active?c:c+'44'}`,
+                background:active?c+'18':'transparent',color:active?c:'var(--ink2)',
+                fontFamily:'var(--sans)',fontWeight:active?600:400,fontSize:'.8rem',cursor:'pointer'}}>
+              {a.framework}
+            </button>;
+          })}
+        </div>
+      )}
       {qs.map((q,i)=>{
         const h=hMap[q.iteration];
         const tc=ROUND_COLORS[q.question_type]||'#64748B';
@@ -655,8 +766,27 @@ function SourcesView({runId}){
   const [filter,setFilter]=useState('all');
   useEffect(()=>{
     if(!runId)return;
-    api(`/api/articles?run_id=${runId}`).then(setArticles);
-    api(`/api/history?run_id=${runId}`).then(setHistory);
+    // load arcs, then collect all articles + history across all arcs
+    api(`/api/arcs?run_id=${runId}`).then(async arcs=>{
+      if(arcs&&arcs.length){
+        // gather articles from all arc_ids
+        const allArticles=[], allHistory=[];
+        for(const arc of arcs){
+          const [arts,arcData] = await Promise.all([
+            api(`/api/articles?run_id=${arc.arc_id}`),
+            api(`/api/arc_history?arc_id=${arc.arc_id}`)
+          ]);
+          allArticles.push(...(arts||[]));
+          allHistory.push(...(arcData?.history||[]));
+        }
+        setArticles(allArticles);
+        setHistory(allHistory);
+      } else {
+        // legacy fallback
+        api(`/api/articles?run_id=${runId}`).then(setArticles);
+        api(`/api/history?run_id=${runId}`).then(setHistory);
+      }
+    });
   },[runId]);
   if(!runId) return <div className="empty">Select a run</div>;
   if(!articles) return <div className="loading pulse">Loading…</div>;
@@ -859,13 +989,245 @@ function RunView({onDone}){
   );
 }
 
+// ── Error Boundary ───────────────────────────────────────────────────────────
+class ErrorBoundary extends React.Component {
+  constructor(props){ super(props); this.state={error:null}; }
+  static getDerivedStateFromError(e){ return {error:e}; }
+  render(){
+    if(this.state.error) return(
+      <div style={{padding:24,background:'var(--red-bg)',border:'1px solid #FECACA',
+        borderRadius:10,fontFamily:'var(--mono)',fontSize:'.82rem',color:'var(--red)'}}>
+        <div style={{fontWeight:600,marginBottom:8}}>Component error — check browser console</div>
+        <div style={{color:'var(--ink2)'}}>{this.state.error?.message}</div>
+        <div style={{marginTop:8,fontSize:'.72rem',color:'var(--ink3)'}}>
+          {this.state.error?.stack?.split('\n').slice(0,3).join('\n')}
+        </div>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+
+// ── Disagreement Map View ────────────────────────────────────────────────────
+const FRAMEWORK_COLORS = {
+  'Structural':  '#1D4ED8',
+  'Agent':       '#7C3AED',
+  'Material':    '#15803D',
+};
+
+function ArcCard({arc, onExpand, expanded}){
+  if(!arc) return null;
+  const color = FRAMEWORK_COLORS[arc.framework] || 'var(--ink3)';
+  const hist  = Array.isArray(arc.history) ? arc.history : [];
+
+  return(
+    <div style={{background:'var(--surface)',border:`1.5px solid ${color}33`,borderRadius:10,
+      overflow:'hidden',boxShadow:'var(--shadow)'}}>
+      <div style={{padding:'14px 18px',borderBottom:`1px solid ${color}22`,
+        background:`${color}08`,cursor:'pointer'}} onClick={onExpand}>
+        <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:8}}>
+          <span style={{background:`${color}18`,color,border:`1px solid ${color}44`,
+            borderRadius:20,padding:'2px 10px',fontSize:'.68rem',fontFamily:'var(--mono)',
+            fontWeight:600}}>{String(arc.framework||'')} </span>
+          <span style={{fontSize:'.78rem',fontWeight:600,color}}>{String(arc.confidence_label||'')} </span>
+          <span style={{marginLeft:'auto',fontSize:'.7rem',color:'var(--ink3)'}}>
+            {expanded?'▲':'▼'}
+          </span>
+        </div>
+        <div style={{fontSize:'.88rem',lineHeight:1.5,color:'var(--ink)',fontWeight:500}}>
+          {String(arc.final_claim||'')}
+        </div>
+      </div>
+      {expanded&&(
+        <div style={{padding:'16px 18px'}}>
+          {arc.final_view&&(
+            <>
+              <div style={{fontSize:'.82rem',color:'var(--ink2)',lineHeight:1.7,
+                fontFamily:'var(--serif)',fontStyle:'italic',marginBottom:14,
+                padding:'10px 14px',background:'var(--bg)',borderRadius:8,
+                borderLeft:`3px solid ${color}`}}>
+                {arc.final_view.plain_english}
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+                <div>
+                  <div style={{fontSize:'.65rem',fontWeight:600,letterSpacing:'.08em',
+                    textTransform:'uppercase',fontFamily:'var(--mono)',
+                    color:'var(--green)',marginBottom:8}}>Supports</div>
+                  {arc.final_view.strongest_for?.map((p,i)=>(
+                    <div key={i} style={{fontSize:'.8rem',color:'var(--ink2)',lineHeight:1.55,
+                      marginBottom:5,paddingLeft:10,borderLeft:'2px solid var(--green)'}}>
+                      {typeof p==='string'?p:JSON.stringify(p)}
+                    </div>
+                  ))}
+                </div>
+                <div>
+                  <div style={{fontSize:'.65rem',fontWeight:600,letterSpacing:'.08em',
+                    textTransform:'uppercase',fontFamily:'var(--mono)',
+                    color:'var(--red)',marginBottom:8}}>Against</div>
+                  {arc.final_view.strongest_against?.map((p,i)=>(
+                    <div key={i} style={{fontSize:'.8rem',color:'var(--ink2)',lineHeight:1.55,
+                      marginBottom:5,paddingLeft:10,borderLeft:'2px solid var(--red)'}}>
+                      {typeof p==='string'?p:JSON.stringify(p)}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+          {hist.length>0&&(
+            <div style={{marginTop:14,paddingTop:12,borderTop:'1px solid var(--border)'}}>
+              <div style={{fontSize:'.68rem',fontFamily:'var(--mono)',color:'var(--ink3)',
+                letterSpacing:'.08em',textTransform:'uppercase',marginBottom:8}}>
+                Confidence arc
+              </div>
+              <div style={{display:'flex',alignItems:'center',gap:4}}>
+                {hist.map((h,i)=>(
+                  <React.Fragment key={i}>
+                    <div style={{textAlign:'center'}}>
+                      <div style={{fontSize:'.68rem',fontFamily:'var(--mono)',
+                        color:confColor(h?.confidence||0),fontWeight:600}}>{pct(h?.confidence||0)}%</div>
+                      <div style={{width:8,height:8,borderRadius:'50%',
+                        background:confColor(h?.confidence||0),margin:'4px auto'}}/>
+                      <div style={{fontSize:'.58rem',color:'var(--ink3)'}}>
+                        {i===0?'start':`r${i}`}
+                      </div>
+                    </div>
+                    {i<hist.length-1&&<div style={{flex:1,height:1,background:'var(--border)'}}/>}
+                  </React.Fragment>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DisagreementMap({runId}){
+  const [arcs, setArcs]     = useState(null);
+  const [comp, setComp]     = useState(null);
+  const [expanded, setExpanded] = useState({});
+
+  useEffect(()=>{
+    if(!runId) return;
+    api(`/api/arcs?run_id=${runId}`)
+      .then(d=>setArcs(Array.isArray(d)?d:[]))
+      .catch(()=>setArcs([]));
+    api(`/api/arc_comparison?run_id=${runId}`)
+      .then(d=>{ if(d&&typeof d==='object'&&!Array.isArray(d)) setComp(d); })
+      .catch(()=>{});
+  },[runId]);
+
+  if(!runId) return <div className="empty">Select a run</div>;
+  if(!arcs)  return <div className="loading pulse">Loading arcs…</div>;
+  if(!arcs.length) return(
+    <div className="empty">
+      No arcs found. This run predates the multi-lens system.<br/>
+      Run a new topic to see the disagreement map.
+    </div>
+  );
+
+  const toggle = id => setExpanded(e=>({...e,[id]:!e[id]}));
+
+  return(
+    <div className="fade-in">
+      <div className="page-title">Disagreement Map</div>
+      <div className="page-sub">
+        Three independent analyses of the same topic, each through a different lens — with zero cross-contamination.
+        Where they agree is most trustworthy. Where they diverge is genuine uncertainty.
+      </div>
+
+      {/* Three arc cards */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:14,marginBottom:24}}>
+        {arcs.filter(a=>a&&a.arc_id).map(arc=>(
+          <ArcCard key={arc.arc_id} arc={arc}
+            expanded={!!expanded[arc.arc_id]}
+            onExpand={()=>toggle(arc.arc_id)}/>
+        ))}
+      </div>
+
+      {/* Comparison */}
+      {comp&&(
+        <>
+          {/* Most robust */}
+          <div style={{background:'var(--green-bg)',border:'1.5px solid #BBF7D0',
+            borderRadius:10,padding:'18px 22px',marginBottom:16}}>
+            <div style={{fontSize:'.68rem',fontWeight:600,letterSpacing:'.1em',
+              textTransform:'uppercase',fontFamily:'var(--mono)',color:'var(--green)',
+              marginBottom:8}}>◆ Most robust finding (all lenses agree)</div>
+            <div style={{fontSize:'.92rem',color:'var(--ink)',lineHeight:1.6,fontWeight:500}}>
+              {String(comp.most_robust||'')}
+            </div>
+          </div>
+
+          <div style={{fontSize:'.82rem',color:'var(--ink2)',lineHeight:1.7,
+            fontFamily:'var(--serif)',padding:'14px 18px',background:'var(--bg)',
+            borderRadius:8,marginBottom:20,borderLeft:'3px solid var(--blue)'}}>
+            {String(comp.plain_english||'')}
+          </div>
+
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+            {/* Convergence */}
+            <div style={{background:'var(--surface)',border:'1px solid var(--border)',
+              borderRadius:10,padding:'16px 18px'}}>
+              <div style={{fontSize:'.68rem',fontWeight:600,letterSpacing:'.08em',
+                textTransform:'uppercase',fontFamily:'var(--mono)',
+                color:'var(--green)',marginBottom:12}}>✓ Where they converge</div>
+              {comp.convergence_points?.map((p,i)=>(
+                <div key={i} style={{fontSize:'.83rem',color:'var(--ink2)',lineHeight:1.6,
+                  marginBottom:8,paddingLeft:12,borderLeft:'2px solid var(--green)'}}>
+                  {typeof p==='string'?p:JSON.stringify(p)}
+                </div>
+              ))}
+            </div>
+
+            {/* Divergence */}
+            <div style={{background:'var(--surface)',border:'1px solid var(--border)',
+              borderRadius:10,padding:'16px 18px'}}>
+              <div style={{fontSize:'.68rem',fontWeight:600,letterSpacing:'.08em',
+                textTransform:'uppercase',fontFamily:'var(--mono)',
+                color:'var(--amber)',marginBottom:12}}>⚡ Where they diverge</div>
+              {comp.divergence_points?.map((p,i)=>(
+                <div key={i} style={{fontSize:'.83rem',color:'var(--ink2)',lineHeight:1.6,
+                  marginBottom:8,paddingLeft:12,borderLeft:'2px solid var(--amber)'}}>
+                  {typeof p==='string'?p:JSON.stringify(p)}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Framework-dependent findings */}
+          {comp.framework_dependent?.length>0&&(
+            <div style={{background:'var(--surface)',border:'1px solid var(--border)',
+              borderRadius:10,padding:'16px 18px',marginTop:14}}>
+              <div style={{fontSize:'.68rem',fontWeight:600,letterSpacing:'.08em',
+                textTransform:'uppercase',fontFamily:'var(--mono)',
+                color:'var(--ink3)',marginBottom:12}}>
+                Only visible from one lens
+              </div>
+              {comp.framework_dependent.map((p,i)=>(
+                <div key={i} style={{fontSize:'.83rem',color:'var(--ink2)',lineHeight:1.6,
+                  marginBottom:8,paddingLeft:12,borderLeft:'2px solid var(--ink3)'}}>
+                  {typeof p==='string'?p:JSON.stringify(p)}
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── NAV CONFIG ──
 const NAV=[
-  {id:'trajectory', icon:'◎', label:'Summary'},
-  {id:'qa',         icon:'↔', label:'How it questioned itself'},
-  {id:'sources',    icon:'⊞', label:'Sources read'},
-  {id:'compare',    icon:'⊜', label:'Compare topics'},
-  {id:'longitudinal',icon:'↷',label:'Belief over time'},
+  {id:'trajectory',    icon:'◎', label:'Summary'},
+  {id:'disagreement',  icon:'⋈', label:'Disagreement Map'},
+  {id:'qa',            icon:'↔', label:'How it questioned itself'},
+  {id:'sources',       icon:'⊞', label:'Sources read'},
+  {id:'compare',       icon:'⊜', label:'Compare topics'},
+  {id:'longitudinal',  icon:'↷', label:'Belief over time'},
 ];
 
 // ── APP ──
@@ -938,8 +1300,9 @@ function App(){
           </span>
         </div>
         <div className="content">
-          {view==='trajectory'  &&<TrajectoryView  runId={runId}/>}
-          {view==='qa'          &&<QAView          runId={runId}/>}
+          {view==='trajectory'    &&<TrajectoryView    runId={runId}/>}
+          {view==='disagreement'  &&<ErrorBoundary><DisagreementMap runId={runId}/></ErrorBoundary>}
+          {view==='qa'            &&<QAView            runId={runId}/>}
           {view==='sources'     &&<SourcesView     runId={runId}/>}
           {view==='compare'     &&<CompareView     topics={topics}/>}
           {view==='longitudinal'&&<LongitudinalView topic={topic}/>}

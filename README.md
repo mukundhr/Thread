@@ -2,23 +2,25 @@
 
 **A belief formation engine. Not a chatbot.**
 
-Thread takes any question, searches the web for real sources, forms an initial belief, then systematically interrogates that belief from four angles : mechanism, counterexample, evidence quality, and internal consistency. It tracks how the belief evolves, what changed it, and what's still unresolved. At the end, it produces a plain-English verdict with a confidence score.
+Thread takes any question, searches the web for real sources, and runs three completely independent analyses through different intellectual lenses — structural, psychological, and material. Each lens forms its own belief, interrogates it from four angles, and produces its own verdict. Then Thread compares all three, showing where they agree (most trustworthy), where they diverge (genuine uncertainty), and what only appears from one lens.
 
-The result isn't a summary. It's a record of reasoning.
+The result isn't a summary. It's a map of how hard a question actually is.
 
 ---
 
 ## Why this is different from asking ChatGPT
 
-When you ask an LLM a question, you get an answer - confident, well-written, no visible reasoning. You don't know what it considered and rejected, how certain it actually is, or where the knowledge breaks down.
+When you ask an LLM a question, you get an answer — confident, well-written, no visible reasoning. You don't know what it considered and rejected, how certain it actually is, or where the knowledge breaks down. You also only get one perspective, framed by whatever the model's training data overrepresents.
 
 Thread does something structurally different:
 
 - It **starts uncertain** and has to earn confidence through evidence
-- It **searches the real web**, grounded in current articles, not just training data
-- It **actively tries to break its own belief**, four rounds, four different attacks
-- It **shows every step**, what changed, what didn't, and why
-- It **tells you what it doesn't know**, the open questions are the honest residue after interrogation
+- It **searches the real web** — grounded in current articles, not just training data
+- It **runs three independent lenses** with no cross-contamination, so you see genuine disagreement
+- It **actively tries to break its own beliefs** — four rounds of interrogation per lens
+- It **uses two different models**: DeepSeek generates beliefs, Gemini Flash critiques them
+- It **shows every step** — what changed, what didn't, and why
+- It **tells you what it doesn't know** — open questions, divergence points, lens-only findings
 
 ChatGPT tells you what to think. Thread shows you how to think about it.
 
@@ -29,28 +31,27 @@ ChatGPT tells you what to think. Thread shows you how to think about it.
 ```
 You give it a topic
         ↓
-Searches the web (DuckDuckGo, no API key needed)
-Different search angles per round, not the same sources repeated
+Three independent lenses run — no cross-contamination:
+
+  [Structural]          [Agent / Psychological]      [Material / Economic]
+  institutions,         individuals, decisions,       resources, incentives,
+  history, systems      psychology, leadership        costs, power
+
+  Each lens independently:
+    ↓ searches the web (different angle per round)
+    ↓ forms an initial belief
+    ↓ Round 1 — Mechanism: "Why is that actually true?"
+    ↓ Round 2 — Counterexample: "Where does this completely break?"
+    ↓ Round 3 — Evidence quality: "How good is the evidence really?"
+    ↓ Round 4 — Consistency: "Does this contradict itself?"
+    ↓ Final verdict per lens
         ↓
-Forms an initial belief
-Uncertain by design. Confidence starts low.
+Comparison: where do the three lenses agree? Where do they split?
         ↓
-Round 1 — Mechanism
-"Why is that actually true? Trace the causal chain."
-        ↓
-Round 2 — Counterexample
-"Find a real historical case where this completely breaks."
-        ↓
-Round 3 — Evidence quality
-"How good is the evidence? Who claims it? What would falsify it?"
-        ↓
-Round 4 — Consistency
-"Does this belief contradict itself or other accepted ideas?"
-        ↓
-Final verdict
-Plain English. Confidence score. Strongest for/against. Still unresolved.
-        ↓
-Everything saved, belief at every step, every source, every answer
+Disagreement Map:
+  Convergence  — what all three agreed on (most robust)
+  Divergence   — where they reached different conclusions
+  Lens-only    — what only appeared from one lens
 ```
 
 ---
@@ -70,38 +71,54 @@ Create a `.env` file:
 OPENROUTER_API_KEY=your_key_here
 ```
 
-**Note on models:** In `thread.py`, you can select any model you like. I chose DeepSeek V3 because it is cheap.
+**Models:** Thread uses DeepSeek V3 as the generator and Gemini Flash lite as the critic. Both are configurable in `thread.py`. DeepSeek V3 was chosen because it is cheap.
 
 ---
 
 ## Usage
 
-### Run a topic from the CLI
-
+### Run a topic
 ```bash
 python thread.py "why do democracies fail"
 python thread.py "does foreign aid make poverty worse"
 python thread.py "why wars happen"
 ```
 
-### Compare multiple topics
+### Skip web search (faster, uses model knowledge only)
+```bash
+python thread.py "why wars happen" --no-search
+```
 
+### Compare multiple topics
 ```bash
 python thread.py "why wars happen" "why civilizations collapse" "why democracies fail"
 ```
 
-### View belief drift over time (run same topic on different days)
-
+### View belief drift over time
 ```bash
 python thread.py "why wars happen" --longitudinal
 ```
 
 ### Launch the dashboard
-
 ```bash
 python server.py
 # open http://localhost:5050
 ```
+
+---
+
+## Dashboard
+
+Six views, all connected to the same SQLite database:
+
+| View | What it shows |
+|---|---|
+| **Summary** | Final verdict + confidence label + full belief arc per lens |
+| **Disagreement Map** | Three lens arcs side by side — convergence, divergence, lens-only findings |
+| **How it questioned itself** | Every question asked and every answer given, in sequence |
+| **Sources read** | Every article fetched, grouped by round, tiered by quality |
+| **Compare topics** | Overlay confidence trajectories across multiple topics |
+| **Belief over time** | Same topic across different days — watch beliefs shift as sources change |
 
 ---
 
@@ -112,42 +129,46 @@ Thread works best on questions where smart people genuinely disagree and evidenc
 - `why do civilizations collapse`
 - `does capitalism create inequality by design`
 - `do we have free will`
+- `why did the Soviet Union fall`
+- `does foreign aid make poverty worse`
+- `are humans naturally violent or peaceful`
+- `why wars happen`
 
-Avoid questions with single factual answers, Thread is built for contested, complex questions where the reasoning process is the point.
+Avoid questions with single factual answers. Thread is built for contested, complex questions where the reasoning process is the point.
 
 ---
 
-The database (`thread.db`) is created automatically on first run and stores everything, runs, belief states at each iteration, every article fetched, every question asked and answered, and the final verdict.
-
----
-
-## The database schema
+## Database schema
 
 ```
 runs              — one row per topic run
-articles          — every article fetched, tagged by round type
-belief_states     — belief at each iteration with cited_article_ids
+arcs              — one row per lens arc (3 per run)
+articles          — every article fetched, with tier + source_type
+belief_states     — belief at each iteration, llm_confidence + computed_confidence
 interrogations    — every question + answer per round
-final_views       — the synthesized final verdict per run
+final_views       — synthesized verdict per arc
+arc_comparisons   — convergence, divergence, lens-only findings per run
 ```
 
-All queryable directly with SQLite if you want to do your own analysis.
+All queryable directly with SQLite.
+The database (`thread.db`) is created automatically on first run.
 
 ---
+
 ## Known limitations
- 
+
 These are honest architectural constraints, not bugs to fix later:
- 
-**Confidence scores are computed, not calibrated.** The percentage shown is derived from source tier quality (35%), evidence balance (25%), and the LLM's self-report (40%). It is not a probability. It does not predict real-world accuracy. It is a structured summary of the epistemic state — more honest than a raw LLM number, but not a scientific metric.
- 
-**Generator and critic are still related models.** DeepSeek generates, Gemini Flash interrogates. Different training distributions means genuinely different blind spots, but both are instruction-tuned LLMs with similar priors. True adversarial pressure would require models with fundamentally different world models.
- 
-**Evidence quality analysis is LLM-assisted, not peer review.** Thread classifies sources into tiers (academic > reputable journalism > blog) and asks the LLM to distinguish RCTs from opinion pieces. It cannot check sample sizes, verify statistical methods, or detect p-hacking. The evidence round is better than nothing, not a substitute for methodological scrutiny.
- 
-**Search results are non-reproducible.** The same topic run on different days will find different sources and may reach different conclusions. This is surfaced transparently — every source used is visible and tiered — but it means Thread outputs are not replicable in the scientific sense.
- 
-Thread is best understood as a **structured reasoning aid**, not a research instrument. The value is in making the reasoning process visible, not in the outputs being calibrated.
- 
+
+**Three lenses, not true independence.** The structural, agent, and material arcs use the same underlying model with different framing prompts. They produce genuinely different perspectives, but they share training data, RLHF tuning, and base reasoning patterns. True epistemic independence would require models with fundamentally different world models.
+
+**Confidence labels are computed, not calibrated.** The label ("Moderately supported", "Contested") is derived from source tier quality (35%), evidence balance (25%), and the LLM's self-report (40%). It describes the epistemic state honestly, but it is not a probability and does not predict real-world accuracy.
+
+**Evidence quality analysis is LLM-assisted, not peer review.** Thread classifies sources into tiers and asks the LLM to distinguish RCTs from opinion pieces. It cannot check sample sizes, verify statistical methods, or detect p-hacking. Better than nothing — not a substitute for methodological scrutiny.
+
+**Search results are non-reproducible.** The same topic run on different days may find different sources and reach different conclusions. Every source used is visible and tiered, but Thread outputs are not replicable in the scientific sense.
+
+Thread is best understood as a **structured reasoning aid**, not a research instrument. The value is in making the reasoning process visible and the disagreements explicit — not in the outputs being ground truth.
+
 ---
 
 ## License

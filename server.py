@@ -9,6 +9,8 @@ from thread import (
     load_belief_history, load_interrogations,
     load_articles_for_run, load_articles_by_ids,
     load_final_belief_per_run, load_final_view,
+    load_arcs_for_run, load_arc_history, load_arc_comparison,
+    confidence_label, FRAMEWORKS,
     count_flips, run_thread,
 )
 
@@ -64,6 +66,48 @@ def api_final_view():
     data   = load_final_view(conn, run_id)
     conn.close()
     return jsonify(data)
+
+@app.route("/api/arcs")
+def api_arcs():
+    run_id = request.args.get("run_id", "")
+    conn   = init_db()
+    arcs   = load_arcs_for_run(conn, run_id)
+    # enrich each arc with its final belief + confidence label
+    result = []
+    for arc in arcs:
+        history = load_arc_history(conn, arc["arc_id"])
+        fv      = load_final_view(conn, arc["arc_id"])
+        final   = history[-1] if history else {}
+        result.append({
+            **arc,
+            "final_claim":      final.get("core_claim", ""),
+            "confidence":       final.get("confidence", 0),
+            "confidence_label": confidence_label(final.get("confidence", 0)),
+            "final_view":       fv,
+            "history":          history,
+        })
+    conn.close()
+    return jsonify(result)
+
+
+@app.route("/api/arc_history")
+def api_arc_history():
+    arc_id = request.args.get("arc_id", "")
+    conn   = init_db()
+    data   = load_arc_history(conn, arc_id)
+    qs     = load_interrogations(conn, arc_id)
+    conn.close()
+    return jsonify({"history": data, "interrogations": qs})
+
+
+@app.route("/api/arc_comparison")
+def api_arc_comparison():
+    run_id = request.args.get("run_id", "")
+    conn   = init_db()
+    data   = load_arc_comparison(conn, run_id)
+    conn.close()
+    return jsonify(data)
+
 
 @app.route("/api/articles")
 def api_articles():

@@ -95,11 +95,14 @@ def build_queries(topic: str, round_type: str | None) -> list[str]:
     Build search queries for a topic + round. Avoids putting the raw topic
     in quotes (breaks DDG) and keeps queries specific enough to avoid garbage.
     """
-    t = topic  # e.g. "why wars happen"
-    # strip leading "why/how/what" for cleaner sub-queries
+    t = topic
+    # strip leading question words for cleaner sub-queries
+    # e.g. "does foreign aid make poverty worse" → "foreign aid make poverty worse"
+    # e.g. "why do wars happen" → "wars happen"
     import re as _re
-    core = _re.sub(r"^(why|how|what|when|where|who)\s+", "", t, flags=_re.IGNORECASE).strip()
-    # e.g. "wars happen" → use as anchor
+    core = _re.sub(r"^(why\s+do(es)?|why\s+did|why\s+is|why\s+are|how\s+do(es)?|what\s+is|what\s+are|does|do\s+we|do\s+they|is\s+it|are\s+we|why|how|what|when|where|who|do|is|are|can|should|will|could)\s+", "", t, flags=_re.IGNORECASE).strip()
+    # further clean: remove trailing "worse/better/true/real" if it reads oddly
+    core = core.strip()
 
     templates = {
         None: [
@@ -291,8 +294,8 @@ def search_news(query: str, max_results: int = 5) -> list[dict]:
                 if len(results) >= max_results:
                     break
         time.sleep(0.4)
-    except Exception as e:
-        print(f"  [searcher] news search failed: {e}")
+    except Exception:
+        pass  # news search is best-effort; text search is primary
     return results
 
 
