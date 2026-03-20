@@ -26,33 +26,187 @@ ChatGPT tells you what to think. Thread shows you how to think about it.
 
 ---
 
-## How it works
+## System Architecture
+
+### Pipeline Overview
 
 ```
-You give it a topic
-        ↓
-Three independent lenses run — no cross-contamination:
-
-  [Structural]          [Agent / Psychological]      [Material / Economic]
-  institutions,         individuals, decisions,       resources, incentives,
-  history, systems      psychology, leadership        costs, power
-
-  Each lens independently:
-    ↓ searches the web (different angle per round)
-    ↓ forms an initial belief
-    ↓ Round 1 — Mechanism: "Why is that actually true?"
-    ↓ Round 2 — Counterexample: "Where does this completely break?"
-    ↓ Round 3 — Evidence quality: "How good is the evidence really?"
-    ↓ Round 4 — Consistency: "Does this contradict itself?"
-    ↓ Final verdict per lens
-        ↓
-Comparison: where do the three lenses agree? Where do they split?
-        ↓
-Disagreement Map:
-  Convergence  — what all three agreed on (most robust)
-  Divergence   — where they reached different conclusions
-  Lens-only    — what only appeared from one lens
+                          ┌─────────────────────┐
+                          │   User Question     │
+                          └──────────┬──────────┘
+                                     │
+                    ┌────────────────┼────────────────┐
+                    │                │                │
+        ┌───────────▼────────┐  ┌────▼────────────┐  │
+        │  Web Search Layer  │  │  Searcher.py    │  │
+        └────────────────────┘  └─────────────────┘  │
+                    │                                 │
+        ┌───────────▼────────────────────────────────▼──────────┐
+        │         Three Parallel Epistemic Arcs                │
+        └─┬──────────────────┬────────────────────┬─────────────┘
+          │                  │                    │
+   ┌──────▼────────┐  ┌──────▼────────┐  ┌──────▼─────────┐
+   │  Structural   │  │  Agent /      │  │  Material  /   │
+   │  Lens         │  │  Psychological│  │  Economic      │
+   │               │  │  Lens         │  │  Lens          │
+   └──────┬────────┘  └──────┬────────┘  └──────┬─────────┘
+          │                  │                  │
+          │        ┌─────────▼────────────┐     │
+          └───────▶│  4-Round Cycle      │◀────┘
+                   │  (per lens)         │
+                   └─────────┬───────────┘
+                             │
+                   ┌─────────▼─────────┐
+                   │ Round 1: Mechanism│
+                   │ → Web search      │
+                   │ → Form belief     │
+                   └─────────┬─────────┘
+                             │
+                   ┌─────────▼──────────┐
+                   │ Round 2: Critique  │
+                   │ → Counterexamples  │
+                   └─────────┬──────────┘
+                             │
+                   ┌─────────▼─────────────┐
+                   │ Round 3: Evidence Qlt │
+                   └─────────┬─────────────┘
+                             │
+                   ┌─────────▼────────────┐
+                   │ Round 4: Consistency │
+                   └─────────┬────────────┘
+                             │
+                   ┌─────────▼─────────────────────┐
+                   │ Final Verdict per Lens        │
+                   │ (confidence + belief state)   │
+                   └─────────┬─────────────────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+   ┌────▼─────┐         ┌────▼─────┐        ┌────▼─────┐
+   │Structural│         │Agent/Psy. │        │ Material │
+   │ Verdict  │         │ Verdict   │        │ Verdict  │
+   └────┬─────┘         └────┬──────┘        └────┬─────┘
+        │                    │                    │
+        └────────────────────┼────────────────────┘
+                             │
+              ┌──────────────▼──────────────┐
+              │   Comparison Layer         │
+              │   Arc Comparison Engine    │
+              └──────────────┬──────────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+   ┌────▼──────────┐  ┌──────▼──────────┐  ┌────▼──────────┐
+   │  Convergence  │  │  Divergence     │  │  Lens-Only    │
+   │  (agreement)  │  │  (disagreement)  │  │  (unique)     │
+   └───────────────┘  └─────────────────┘  └───────────────┘
 ```
+
+### Component Details
+
+#### 1. **Searcher Layer** (`searcher.py`)
+- Uses DuckDuckGo API for web search (via `ddgs` library)
+- **Domain filtering**:
+  - **Blocked**: social media, aggregators, low-quality blogs
+  - **Preferred**: news, academic, think tanks, historical journals
+- Returns tiered sources based on domain authority
+- Called once per interrogation round per lens (12 searches total per run)
+
+#### 2. **Three Epistemic Frameworks** (in `thread.py`)
+Each framework uses the same generator model (DeepSeek V3) but with distinct prompt instructions:
+
+| Lens | Focus | Query Angle |
+|------|-------|-----------|
+| **Structural** | Systems, institutions, path dependency, historical forces | "What structural conditions made this inevitable?" |
+| **Agent/Psychological** | Individual decisions, psychology, cognition, leadership | "What did people choose? Why did they believe what they believed?" |
+| **Material/Economic** | Resources, incentives, costs, power distribution | "Follow the money. Who gains? What are the material incentives?" |
+
+Each lens independently:
+1. Searches the web from its own perspective
+2. Forms an initial belief with confidence estimate
+3. Runs through 4 interrogation rounds (see below)
+4. Updates belief based on adversarial critique
+5. Generates final verdict with computed confidence
+
+#### 3. **Interrogation System** (4 rounds per lens)
+Each round involves:
+- **New web search** (context-aware for that interrogation type)
+- **Generator model** (DeepSeek) answers the round's question
+- **Critic model** (Gemini Flash) reviews the answer and flags weaknesses
+- **Belief state update** based on new evidence and critique
+
+| Round | Question | Purpose |
+|-------|----------|---------|
+| **Mechanism** | "Why is that actually true?" | Expose hidden assumptions, trace causal chains |
+| **Counterexample** | "Where does this fail completely?" | Find bitter contradictions and edge cases |
+| **Evidence Quality** | "How good is the evidence really?" | Evaluate source credibility, incentives, methodology |
+| **Consistency** | "Does this contradict itself?" | Identify internal tensions and logical failures |
+
+#### 4. **Belief State Tracking**
+Every belief is represented as:
+```json
+{
+  "core_claim": "the current best explanation",
+  "confidence": 0.65,
+  "supporting_evidence": ["point [source]"],
+  "contradicting_evidence": ["counter [source]"],
+  "open_questions": ["what remains unresolved"],
+  "used_sources": [1, 3, 4]
+}
+```
+
+State evolves through 4 rounds → final verdict with **two confidence metrics**:
+- **LLM confidence**: model's self-reported certainty
+- **Computed confidence**: weighted by source tiers, evidence balance, and model report
+
+#### 5. **Database Persistence** (`thread.db`)
+SQLite schema tracks the complete reasoning trajectory:
+- `runs` — unique query executions
+- `arcs` — one structural/agent/material arc per run
+- `belief_states` — snapshot at each of 4 rounds + final
+- `interrogations` — every question asked and answer given
+- `articles` — sources fetched, tiered by authority
+- `final_views` — synthesized verdicts per arc
+- `arc_comparisons` — convergence/divergence/lens-only findings
+
+#### 6. **Comparison Engine**
+After all three lenses complete:
+- **Convergence**: what all three agree on (most epistemically robust)
+- **Divergence**: where lenses reached fundamentally different conclusions
+- **Lens-Only**: what only appeared from one lens's perspective
+
+#### 7. **Flask Dashboard** (`server.py`)
+Web UI with 6 views, all backed by the same database:
+- Summary view (final verdicts + confidence labels per arc)
+- Disagreement map (parallel arc evolution + convergence analysis)
+- Interrogation transcript (all questions/answers in sequence)
+- Source inventory (articles tiered by quality, grouped by round)
+- Topic comparison (overlay confidence trajectories)
+- Longitudinal view (same topic across multiple runs/days)
+
+### Model Selection
+
+- **Generator**: DeepSeek V3.2 (via OpenRouter)
+  - Reason: cheap, capable, good reasoning over long contexts
+  - Role: forms initial beliefs, answers interrogation rounds
+
+- **Critic**: Gemini Flash 2.5 Lite (via OpenRouter)
+  - Reason: different training distribution from DeepSeek creates adversarial pressure
+  - Role: interrogates and critiques each belief, flags weaknesses
+
+### Confidence Labeling
+
+Computed confidence combines three signals (weighted):
+- **Source tier quality** (35%): Are the sources authoritative?
+- **Evidence balance** (25%): Is there genuine disagreement in sources?
+- **LLM self-report** (40%): How certain did the model claim to be?
+
+Results in honest labels (not probabilities):
+- "Strongly supported" (≥80%)
+- "Well supported" (65-79%)
+- "Moderately supported" (50-64%)
+- "Contested" (35-49%)
+- "Poorly supported" (<35%)
 
 ---
 
