@@ -20,7 +20,10 @@ import argparse
 from typing import Optional
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL   = "deepseek/deepseek-chat-v3-0324"
+# Two different models = genuine adversarial pressure
+# Generator forms beliefs; Critic interrogates them from a different training distribution
+GENERATOR_MODEL = "deepseek/deepseek-chat-v3-0324"       # forms beliefs
+CRITIC_MODEL    = "google/gemini-flash-1.5"               # interrogates them
 DB_PATH = "thread.db"
 
 INTERROGATION_ROUNDS = [
@@ -58,11 +61,12 @@ Rules:
 
 
 # ── LLM ──────────────────────────────────────────────────────────────────────
-def call_llm(messages: list, expect_json: bool = False) -> str:
+def call_llm(messages: list, expect_json: bool = False,
+             model: str = None) -> str:
     if not OPENROUTER_API_KEY:
         raise ValueError("Set OPENROUTER_API_KEY env var")
     payload = {
-        "model": MODEL,
+        "model": model or GENERATOR_MODEL,
         "messages": messages,
         "temperature": 0.7,
     }
@@ -100,6 +104,8 @@ def init_db() -> sqlite3.Connection:
             snippet     TEXT,
             source      TEXT,
             published   TEXT,
+            tier        INTEGER NOT NULL DEFAULT 3,
+            source_type TEXT NOT NULL DEFAULT 'unknown',
             fetched_at  TEXT NOT NULL
         );
 
@@ -109,7 +115,9 @@ def init_db() -> sqlite3.Connection:
             topic               TEXT NOT NULL,
             iteration           INTEGER NOT NULL,
             core_claim          TEXT NOT NULL,
-            confidence          REAL NOT NULL,
+            llm_confidence      REAL NOT NULL,
+            computed_confidence REAL NOT NULL,
+            confidence_breakdown TEXT NOT NULL DEFAULT '{}',
             supporting          TEXT NOT NULL,
             contradicting       TEXT NOT NULL,
             open_questions      TEXT NOT NULL,
@@ -152,39 +160,52 @@ def new_run_id(topic: str) -> str:
 
 def save_articles(conn, run_id: str, articles: list[dict],
                   round_type: Optional[str]) -> list[int]:
-    """Store articles, return their DB ids."""
+    """Store articles with tier + source_type. Returns DB ids."""
     ids = []
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     for a in articles:
         cur = conn.execute("""
-            INSERT INTO articles (run_id, round_type, title, url, snippet, source, published, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO articles
+                (run_id, round_type, title, url, snippet, source, published, tier, source_type, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (run_id, round_type, a.get("title",""), a.get("url",""),
-              a.get("snippet",""), a.get("source",""), a.get("published",""), now))
+              a.get("snippet",""), a.get("source",""), a.get("published",""),
+              a.get("tier", 3), a.get("source_type", "unknown"), now))
         ids.append(cur.lastrowid)
     conn.commit()
     return ids
 
 
 def save_belief(conn, run_id: str, topic: str, iteration: int,
-                belief: dict, article_ids: list[int]):
+                belief: dict, article_ids: list[int],
+                articles: list[dict] = None):
     """
-    Save a belief state. article_ids = DB ids of articles fetched for this round.
-    used_sources from the LLM are indices (1-based) into that round's article list.
-    We map them → actual DB article ids.
+    Save a belief state with both LLM-reported and computed confidence.
+    article_ids = DB ids for this round; articles = raw dicts for tier scoring.
     """
-    used_indices  = [i - 1 for i in belief.get("used_sources", []) if isinstance(i, int)]
-    cited_db_ids  = [article_ids[i] for i in used_indices if 0 <= i < len(article_ids)]
+    used_indices = [i - 1 for i in belief.get("used_sources", []) if isinstance(i, int)]
+    cited_db_ids = [article_ids[i] for i in used_indices if 0 <= i < len(article_ids)]
+
+    # use cited articles for quality scoring; fall back to all round articles
+    cited_articles = [articles[i] for i in used_indices if articles and 0 <= i < len(articles)]
+    if not cited_articles and articles:
+        cited_articles = articles
+
+    llm_conf  = float(belief.get("confidence", 0.5))
+    breakdown = compute_confidence(llm_conf, cited_articles, belief)
+    computed  = breakdown["computed"]
 
     conn.execute("""
         INSERT INTO belief_states
-            (run_id, topic, iteration, core_claim, confidence,
+            (run_id, topic, iteration, core_claim,
+             llm_confidence, computed_confidence, confidence_breakdown,
              supporting, contradicting, open_questions, cited_article_ids, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         run_id, topic, iteration,
         belief["core_claim"],
-        belief["confidence"],
+        llm_conf, computed,
+        json.dumps(breakdown),
         json.dumps(belief.get("supporting_evidence", [])),
         json.dumps(belief.get("contradicting_evidence", [])),
         json.dumps(belief.get("open_questions", [])),
@@ -192,6 +213,68 @@ def save_belief(conn, run_id: str, topic: str, iteration: int,
         datetime.datetime.now(datetime.timezone.utc).isoformat(),
     ))
     conn.commit()
+    return breakdown
+
+
+# ── Confidence computation ────────────────────────────────────────────────────
+TIER_SCORES = {1: 1.0, 2: 0.55, 3: 0.15}
+SOURCE_TYPE_SCORES = {
+    "rct": 1.0, "meta-analysis": 1.0, "systematic-review": 0.95,
+    "peer-reviewed": 0.85, "preprint": 0.65,
+    "government-data": 0.80, "primary-data": 0.80,
+    "think-tank": 0.60, "journalism": 0.50,
+    "expert-opinion": 0.45, "blog": 0.20, "unknown": 0.25,
+}
+
+def compute_confidence(llm_conf: float, articles: list, belief: dict) -> dict:
+    """
+    Derive confidence from observable quantities rather than trusting
+    the LLM's self-reported number alone.
+
+    Components:
+      - llm_conf (40%)  : LLM self-report — useful signal, not gospel
+      - source_quality (35%) : average tier score of cited articles
+      - evidence_ratio (25%) : supporting / (supporting + contradicting)
+      - open_penalty         : subtract for unresolved questions
+    """
+    # source quality from cited articles
+    if articles:
+        avg_tier  = sum(TIER_SCORES.get(a.get("tier", 3), 0.15) for a in articles) / len(articles)
+        avg_stype = sum(SOURCE_TYPE_SCORES.get(a.get("source_type","unknown"), 0.25)
+                        for a in articles) / len(articles)
+        source_quality = (avg_tier + avg_stype) / 2
+    else:
+        source_quality = 0.10  # no sources = honest uncertainty
+
+    # evidence balance
+    n_sup = len(belief.get("supporting_evidence", []))
+    n_con = len(belief.get("contradicting_evidence", []))
+    total = n_sup + n_con
+    evidence_ratio = (n_sup / total) if total > 0 else 0.5
+
+    # open questions penalty (each unresolved question = -4%, max -20%)
+    n_open       = len(belief.get("open_questions", []))
+    open_penalty = min(n_open * 0.04, 0.20)
+
+    computed = (
+        0.40 * llm_conf +
+        0.35 * source_quality +
+        0.25 * evidence_ratio -
+        open_penalty
+    )
+    computed = round(max(0.05, min(0.95, computed)), 2)
+
+    return {
+        "llm_reported":     round(llm_conf, 2),
+        "computed":         computed,
+        "source_quality":   round(source_quality, 2),
+        "evidence_ratio":   round(evidence_ratio, 2),
+        "open_penalty":     round(open_penalty, 2),
+        "n_sources":        len(articles),
+        "n_supporting":     n_sup,
+        "n_contradicting":  n_con,
+        "n_open":           n_open,
+    }
 
 
 def save_interrogation(conn, run_id: str, iteration: int,
@@ -206,21 +289,46 @@ def save_interrogation(conn, run_id: str, iteration: int,
 
 # ── DB reads ──────────────────────────────────────────────────────────────────
 def load_belief_history(conn, run_id: str) -> list[dict]:
-    rows = conn.execute("""
-        SELECT iteration, core_claim, confidence, supporting,
-               contradicting, open_questions, cited_article_ids, timestamp
-        FROM belief_states WHERE run_id = ? ORDER BY iteration
-    """, (run_id,)).fetchall()
-    return [{
-        "iteration":              r[0],
-        "core_claim":             r[1],
-        "confidence":             r[2],
-        "supporting_evidence":    json.loads(r[3]),
-        "contradicting_evidence": json.loads(r[4]),
-        "open_questions":         json.loads(r[5]),
-        "cited_article_ids":      json.loads(r[6]),
-        "timestamp":              r[7],
-    } for r in rows]
+    # handle both old schema (confidence) and new (llm_confidence + computed_confidence)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(belief_states)").fetchall()]
+    if "llm_confidence" in cols:
+        rows = conn.execute("""
+            SELECT iteration, core_claim, llm_confidence, computed_confidence,
+                   confidence_breakdown, supporting, contradicting, open_questions,
+                   cited_article_ids, timestamp
+            FROM belief_states WHERE run_id = ? ORDER BY iteration
+        """, (run_id,)).fetchall()
+        return [{
+            "iteration":              r[0],
+            "core_claim":             r[1],
+            "llm_confidence":         r[2],
+            "confidence":             r[3],   # computed — this is what UI shows
+            "confidence_breakdown":   json.loads(r[4] or "{}"),
+            "supporting_evidence":    json.loads(r[5]),
+            "contradicting_evidence": json.loads(r[6]),
+            "open_questions":         json.loads(r[7]),
+            "cited_article_ids":      json.loads(r[8]),
+            "timestamp":              r[9],
+        } for r in rows]
+    else:
+        # old schema fallback
+        rows = conn.execute("""
+            SELECT iteration, core_claim, confidence, supporting,
+                   contradicting, open_questions, cited_article_ids, timestamp
+            FROM belief_states WHERE run_id = ? ORDER BY iteration
+        """, (run_id,)).fetchall()
+        return [{
+            "iteration":              r[0],
+            "core_claim":             r[1],
+            "llm_confidence":         r[2],
+            "confidence":             r[2],
+            "confidence_breakdown":   {},
+            "supporting_evidence":    json.loads(r[3]),
+            "contradicting_evidence": json.loads(r[4]),
+            "open_questions":         json.loads(r[5]),
+            "cited_article_ids":      json.loads(r[6]),
+            "timestamp":              r[7],
+        } for r in rows]
 
 
 def load_interrogations(conn, run_id: str) -> list[dict]:
@@ -238,14 +346,23 @@ def load_interrogations(conn, run_id: str) -> list[dict]:
 
 
 def load_articles_for_run(conn, run_id: str) -> list[dict]:
-    rows = conn.execute("""
-        SELECT id, round_type, title, url, snippet, source, published
-        FROM articles WHERE run_id = ? ORDER BY id
-    """, (run_id,)).fetchall()
-    return [{
-        "id": r[0], "round_type": r[1], "title": r[2],
-        "url": r[3], "snippet": r[4], "source": r[5], "published": r[6],
-    } for r in rows]
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(articles)").fetchall()]
+    if "tier" in cols:
+        rows = conn.execute("""
+            SELECT id, round_type, title, url, snippet, source, published, tier, source_type
+            FROM articles WHERE run_id = ? ORDER BY id
+        """, (run_id,)).fetchall()
+        return [{"id":r[0],"round_type":r[1],"title":r[2],"url":r[3],
+                 "snippet":r[4],"source":r[5],"published":r[6],
+                 "tier":r[7],"source_type":r[8]} for r in rows]
+    else:
+        rows = conn.execute("""
+            SELECT id, round_type, title, url, snippet, source, published
+            FROM articles WHERE run_id = ? ORDER BY id
+        """, (run_id,)).fetchall()
+        return [{"id":r[0],"round_type":r[1],"title":r[2],"url":r[3],
+                 "snippet":r[4],"source":r[5],"published":r[6],
+                 "tier":3,"source_type":"unknown"} for r in rows]
 
 
 def load_articles_by_ids(conn, ids: list[int]) -> list[dict]:
@@ -285,6 +402,31 @@ def load_final_belief_per_run(conn, topic: str) -> list[dict]:
 
 
 # ── Final View ────────────────────────────────────────────────────────────────
+# ── Evidence classification schema ────────────────────────────────────────────
+EVIDENCE_CLASSIFICATION_SCHEMA = """
+Before evaluating evidence quality, classify each source. Return ONLY valid JSON:
+{
+  "source_classifications": [
+    {
+      "index": 1,
+      "source_type": "peer-reviewed|meta-analysis|rct|systematic-review|preprint|government-data|primary-data|think-tank|journalism|expert-opinion|blog|unknown",
+      "study_design": "what kind of evidence is this? (e.g. RCT, observational cohort, survey, opinion, historical analysis)",
+      "sample_or_scope": "what population/scope does this cover?",
+      "key_limitation": "biggest methodological weakness",
+      "weight": "high|medium|low"
+    }
+  ],
+  "core_claim": "updated claim after evaluating source quality",
+  "confidence": 0.0,
+  "supporting_evidence": ["point citing sources [N]"],
+  "contradicting_evidence": ["counter citing sources [N]"],
+  "open_questions": ["what would require better evidence to resolve"],
+  "used_sources": [1, 2],
+  "interrogation_result": "what changed after scrutinising evidence quality"
+}
+"""
+
+
 FINAL_VIEW_SCHEMA = """
 Return ONLY valid JSON, no markdown:
 {
@@ -430,42 +572,49 @@ def research_prompt(topic: str, sources_block: str) -> list:
 
 def interrogation_prompt(topic: str, belief: dict,
                          q_type: str, question: str,
-                         sources_block: str) -> list:
-    prev_supporting  = [e.split("[")[0].strip() for e in belief.get("supporting_evidence", [])]
-    prev_contra      = [e.split("[")[0].strip() for e in belief.get("contradicting_evidence", [])]
-    prev_open        = belief.get("open_questions", [])
+                         sources_block: str) -> tuple[list, str]:
+    """Returns (messages, model_to_use). Critic uses CRITIC_MODEL."""
+    prev_supporting = [e.split("[")[0].strip() for e in belief.get("supporting_evidence", [])]
+    prev_contra     = [e.split("[")[0].strip() for e in belief.get("contradicting_evidence", [])]
+    prev_open       = belief.get("open_questions", [])
 
-    return [
+    # evidence round uses structured source classification
+    if q_type == "evidence":
+        schema = EVIDENCE_CLASSIFICATION_SCHEMA
+        extra  = (
+            "Classify EVERY source before evaluating it. "
+            "Distinguish between RCTs, observational studies, expert opinion, and journalism. "
+            "Downweight low-quality sources explicitly. "
+            "Only update confidence if the best-quality sources support or undermine the claim."
+        )
+    else:
+        schema = BELIEF_SCHEMA + '\n"interrogation_result": "what specifically changed this round and why"'
+        extra  = ""
+
+    messages = [
         {"role": "system", "content": (
-            "You are a rigorous intellectual critic doing a deep interrogation of a belief. "
-            "STRICT RULES:\n"
-            "1. You MUST produce NEW evidence points. Do not reuse or rephrase any of the "
-            "previous supporting_evidence or contradicting_evidence. Every item in your output "
-            "must make a point not already present in the belief.\n"
-            "2. The core_claim MUST change wording if anything new was discovered — even slightly. "
-            "Identical claims across rounds means you failed.\n"
-            "3. If sources are irrelevant, ignore them and reason from your own deep knowledge.\n"
-            "4. This round's focus is specifically: {q_type}. Stay on that angle.\n"
-            "5. Be genuinely critical — find the real weakness in this belief for this round type."
-        ).replace("{q_type}", q_type)},
+            f"You are a rigorous critic interrogating a belief from the [{q_type.upper()}] angle. "
+            "You were trained differently from the model that generated this belief — use that difference. "
+            "RULES:\n"
+            "1. Every evidence point must be NEW — do not reuse or rephrase previous points.\n"
+            "2. The core_claim must change wording if this round revealed something new.\n"
+            "3. Ignore irrelevant sources. Reason from knowledge when sources are weak.\n"
+            f"4. {extra if extra else 'Find the genuine weakness specific to this angle.'}"
+        )},
         {"role": "user", "content": (
             f"Topic: \"{topic}\"\n\n"
-            f"Current belief (DO NOT copy these into your output):\n"
-            f"Claim: {belief.get('core_claim', '')}\n"
-            f"Confidence: {belief.get('confidence', 0.5)}\n"
-            f"Previous supporting points (DO NOT reuse): {prev_supporting}\n"
-            f"Previous contradicting points (DO NOT reuse): {prev_contra}\n"
-            f"Previous open questions (DO NOT reuse): {prev_open}\n\n"
-            f"Interrogation type [{q_type.upper()}]: {question}\n\n"
-            f"Sources (use if relevant, ignore if not):\n{sources_block}\n\n"
-            "Produce an updated belief with ENTIRELY NEW evidence points specific to this "
-            f"[{q_type}] challenge. The claim should evolve to reflect what this round revealed. "
-            "Confidence goes up if the belief survives, down if a real gap was found.\n"
-            "Add 'interrogation_result': one sentence — what specifically changed this round and why.\n"
-            f"{BELIEF_SCHEMA}\n"
-            '"interrogation_result": "what specifically changed this round and why"'
+            f"Current belief — DO NOT copy into output:\n"
+            f"  Claim: {belief.get('core_claim', '')}\n"
+            f"  Confidence: {belief.get('confidence', 0.5)}\n"
+            f"  Previous supporting (DO NOT reuse): {prev_supporting}\n"
+            f"  Previous contradicting (DO NOT reuse): {prev_contra}\n"
+            f"  Previous open questions (DO NOT reuse): {prev_open}\n\n"
+            f"Interrogation [{q_type.upper()}]: {question}\n\n"
+            f"Sources:\n{sources_block}\n\n"
+            f"{schema}"
         )},
     ]
+    return messages, CRITIC_MODEL
 
 
 # ── Core run ──────────────────────────────────────────────────────────────────
@@ -493,21 +642,22 @@ def run_thread(topic: str, use_search: bool = True) -> str:
     )
     seen_urls.update(a["url"] for a in articles if a.get("url"))
 
-    print("📚  Forming initial belief...\n")
-    raw    = call_llm(research_prompt(topic, sources_block), expect_json=True)
+    print(f"📚  Forming initial belief... [generator: {GENERATOR_MODEL.split('/')[-1]}]\n")
+    raw    = call_llm(research_prompt(topic, sources_block), expect_json=True,
+                      model=GENERATOR_MODEL)
     belief = safe_parse(raw)
     if not belief:
         return run_id
 
     print_belief(belief, iteration=0)
-    save_belief(conn, run_id, topic, 0, belief, article_ids)
+    save_belief(conn, run_id, topic, 0, belief, article_ids, articles)
     save_interrogation(conn, run_id, 0, "initial", f'What is the initial belief about "{topic}"?',
                        belief.get("core_claim", ""))
 
     # ── interrogation rounds ──────────────────────────────────────────────────
     for i, (q_type, question) in enumerate(INTERROGATION_ROUNDS, start=1):
         print(f"\n{'─'*66}")
-        print(f"🔍  Round {i}/4 — {q_type.upper()}")
+        print(f"🔍  Round {i}/4 — {q_type.upper()}  [critic: {CRITIC_MODEL.split('/')[-1]}]")
         print(f"    {question[:72]}...")
         print(f"{'─'*66}\n")
 
@@ -516,20 +666,20 @@ def run_thread(topic: str, use_search: bool = True) -> str:
         )
         seen_urls.update(a["url"] for a in articles if a.get("url"))
 
-        raw        = call_llm(
-            interrogation_prompt(topic, belief, q_type, question, sources_block),
-            expect_json=True
-        )
+        messages, critic_model = interrogation_prompt(topic, belief, q_type, question, sources_block)
+        raw        = call_llm(messages, expect_json=True, model=critic_model)
         new_belief = safe_parse(raw)
         if not new_belief:
             continue
 
+        # evidence round may have extra classification keys — strip non-standard ones
+        new_belief.pop("source_classifications", None)
         answer = new_belief.pop("interrogation_result", f"{q_type} probe")
         delta  = new_belief["confidence"] - belief["confidence"]
         belief = new_belief
 
         print_belief(belief, iteration=i, delta=delta, trigger=answer)
-        save_belief(conn, run_id, topic, i, belief, article_ids)
+        save_belief(conn, run_id, topic, i, belief, article_ids, articles)
         save_interrogation(conn, run_id, i, q_type, question, answer)
 
     # ── final view ────────────────────────────────────────────────────────────

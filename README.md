@@ -134,7 +134,21 @@ final_views       — the synthesized final verdict per run
 All queryable directly with SQLite if you want to do your own analysis.
 
 ---
-
+## Known limitations
+ 
+These are honest architectural constraints, not bugs to fix later:
+ 
+**Confidence scores are computed, not calibrated.** The percentage shown is derived from source tier quality (35%), evidence balance (25%), and the LLM's self-report (40%). It is not a probability. It does not predict real-world accuracy. It is a structured summary of the epistemic state — more honest than a raw LLM number, but not a scientific metric.
+ 
+**Generator and critic are still related models.** DeepSeek generates, Gemini Flash interrogates. Different training distributions means genuinely different blind spots, but both are instruction-tuned LLMs with similar priors. True adversarial pressure would require models with fundamentally different world models.
+ 
+**Evidence quality analysis is LLM-assisted, not peer review.** Thread classifies sources into tiers (academic > reputable journalism > blog) and asks the LLM to distinguish RCTs from opinion pieces. It cannot check sample sizes, verify statistical methods, or detect p-hacking. The evidence round is better than nothing, not a substitute for methodological scrutiny.
+ 
+**Search results are non-reproducible.** The same topic run on different days will find different sources and may reach different conclusions. This is surfaced transparently — every source used is visible and tiered — but it means Thread outputs are not replicable in the scientific sense.
+ 
+Thread is best understood as a **structured reasoning aid**, not a research instrument. The value is in making the reasoning process visible, not in the outputs being calibrated.
+ 
+---
 
 ## License
 

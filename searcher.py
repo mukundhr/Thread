@@ -8,7 +8,6 @@ import time
 import requests
 from ddgs import DDGS
 
-
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
 
 # ── Blocked domains ───────────────────────────────────────────────────────────
@@ -145,6 +144,74 @@ def _domain(url: str) -> str:
     return m.group(1) if m else ""
 
 
+# ── Source tier + type classification ────────────────────────────────────────
+# Tier 1: peer-reviewed, primary data, government stats
+# Tier 2: reputable journalism, think tanks, established reference
+# Tier 3: blog, opinion, unknown
+
+TIER1_DOMAINS = {
+    "pubmed.ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov", "pnas.org",
+    "nature.com", "science.org", "cell.com", "thelancet.com",
+    "nejm.org", "bmj.com", "jamanetwork.com",
+    "scholar.google.com", "semanticscholar.org",
+    "jstor.org", "cambridge.org", "oup.com",
+    "rand.org", "brookings.edu", "who.int", "un.org",
+    "data.worldbank.org", "ourworldindata.org",
+    "web.stanford.edu", "mit.edu", "harvard.edu",
+    "pmc.ncbi.nlm.nih.gov", "journals.plos.org",
+    "academic.oup.com", "onlinelibrary.wiley.com",
+    "ssrn.com", "arxiv.org", "medrxiv.org",
+    "ppublishing.org", "cambridge.org", "pnas.org",
+    "academiccommons.columbia.edu", "journals.flvc.org",
+}
+
+TIER1_SOURCE_TYPES = {
+    "pubmed.ncbi.nlm.nih.gov": "peer-reviewed",
+    "pmc.ncbi.nlm.nih.gov":    "peer-reviewed",
+    "pnas.org":                "peer-reviewed",
+    "nature.com":              "peer-reviewed",
+    "science.org":             "peer-reviewed",
+    "ourworldindata.org":      "primary-data",
+    "rand.org":                "think-tank",
+    "brookings.edu":           "think-tank",
+    "who.int":                 "government-data",
+    "arxiv.org":               "preprint",
+    "ssrn.com":                "preprint",
+}
+
+TIER2_DOMAINS = {
+    "bbc.com", "bbc.co.uk", "reuters.com", "apnews.com",
+    "theguardian.com", "nytimes.com", "washingtonpost.com",
+    "aljazeera.com", "dw.com", "france24.com", "time.com",
+    "foreignaffairs.com", "foreignpolicy.com",
+    "nationalinterest.org", "cfr.org", "chathamhouse.org",
+    "fpri.org", "crisisgroup.org", "usip.org", "wilsoncenter.org",
+    "britannica.com", "wikipedia.org", "historyextra.com",
+    "smithsonianmag.com", "scientificamerican.com",
+    "theatlantic.com", "press.uchicago.edu", "nyupress.org",
+    "palladiummag.com", "scispace.com", "resilience.org",
+    "archive.org", "books.google.com",
+    "mwi.westpoint.edu", "activehistory.co.uk",
+    "polsci.institute", "historytoday.com",
+}
+
+
+def get_source_tier(url: str) -> tuple[int, str]:
+    """Return (tier, source_type) for a URL."""
+    d = _domain(url)
+    if any(d == t or d.endswith("." + t) for t in TIER1_DOMAINS):  # noqa
+        stype = TIER1_SOURCE_TYPES.get(d, "peer-reviewed")
+        return 1, stype
+    if any(d == t or d.endswith("." + t) for t in TIER2_DOMAINS):
+        # journalism vs think-tank vs reference
+        if any(x in d for x in ["rand","brookings","cfr","fpri","chatham","crisisgroup","usip","wilson","palladium"]):
+            return 2, "think-tank"
+        if any(x in d for x in ["britannica","wikipedia","archive","books.google"]):
+            return 2, "expert-opinion"
+        return 2, "journalism"
+    return 3, "blog"
+
+
 def _is_blocked(url: str) -> bool:
     d = _domain(url)
     return (
@@ -190,12 +257,15 @@ def search_web(query: str, max_results: int = 6) -> list[dict]:
                     continue
                 if _is_junk_snippet(snippet):
                     continue
+                tier, stype = get_source_tier(url)
                 results.append({
-                    "title":     r.get("title", ""),
-                    "url":       url,
-                    "snippet":   snippet,
-                    "source":    _domain(url),
-                    "published": "",
+                    "title":       r.get("title", ""),
+                    "url":         url,
+                    "snippet":     snippet,
+                    "source":      _domain(url),
+                    "published":   "",
+                    "tier":        tier,
+                    "source_type": stype,
                 })
                 if len(results) >= max_results:
                     break
@@ -213,12 +283,15 @@ def search_news(query: str, max_results: int = 5) -> list[dict]:
                 url = r.get("url", "")
                 if not url or _is_blocked(url):
                     continue
+                tier, stype = get_source_tier(url)
                 results.append({
-                    "title":     r.get("title", ""),
-                    "url":       url,
-                    "snippet":   r.get("body", ""),
-                    "source":    r.get("source", _domain(url)),
-                    "published": r.get("date", ""),
+                    "title":       r.get("title", ""),
+                    "url":         url,
+                    "snippet":     r.get("body", ""),
+                    "source":      r.get("source", _domain(url)),
+                    "published":   r.get("date", ""),
+                    "tier":        tier,
+                    "source_type": stype,
                 })
                 if len(results) >= max_results:
                     break
